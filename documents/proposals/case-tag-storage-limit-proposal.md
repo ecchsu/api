@@ -1,6 +1,6 @@
 # Case Tag Storage Limit — Proposal
 
-**Status:** Draft, for review
+**Status:** Both options implemented and live-tested as separate branches; pending a decision (§7 has the exact code changes for each)
 **Author:** Generated with Claude Code, reviewed by ecc.hsu@gmail.com
 **Related code:** `CaseTagController` / `CaseTagService` / `CaseTagRepository` / `MockTagSyncService` (arex-web-api, arex-web-core)
 
@@ -278,3 +278,413 @@ The open questions from the original draft have been resolved:
 Since `usagePercent` is recomputed and re-persisted synchronously on every tag write (§6.3) and on every override change (§6.3.1), a Grafana panel querying this collection directly always reflects current state — there's no separate batch/cron export job to keep in sync, and no risk of the dashboard showing a stale percentage against a since-changed limit.
 
 The `case_tag_alert_threshold` value in `SystemConfiguration` (§6.4) can be surfaced on the same dashboard (e.g. as a fixed threshold line on the utilization panel) so the visual cap and the actual enforced/alerted-on cap are always the same number, not two values that can drift apart.
+
+## 7. Implementation reference — exact code changes per option
+
+Both options are fully implemented, live-tested against a real local stack (real Mongo data, real JWT auth, real `ReplayCompareResult` records — see the test results recorded below each), and pushed as separate branches on top of the base tagging feature:
+
+| Branch | What it implements |
+|---|---|
+| `feature/case-tag-base` | The tagging mechanism itself (`CaseTagController`/`CaseTagService`/`CaseTagRepository`/`MockTagSyncService`/`CaseTagCollection`/`CaseTagDto`/`CaseTagMapper`), no limit. **Prerequisite for both options below** — apply this first if your existing code doesn't already have it. |
+| `feature/case-tag-limit-count` | §7.1 below — count limit, scoped per `(appId, operationName)` |
+| `feature/case-tag-limit-byte-and-count` | §7.2 below — byte budget + count backstop, scoped per `appId` |
+
+Everything below is the exact diff from `feature/case-tag-base` — apply it on top of the base tagging feature in your own codebase.
+
+### 7.1 Option: per-operation count limit (`feature/case-tag-limit-count`)
+
+**6 files touched: 1 new field + index, 2 new methods, 1 new response field, 1 new config block.**
+
+**1. `arex-web-model/.../dao/mongodb/CaseTagCollection.java`** — add a compound index so the count check stays cheap:
+```diff
+ import lombok.Data;
+ import lombok.EqualsAndHashCode;
+ import lombok.experimental.FieldNameConstants;
++import org.springframework.data.mongodb.core.index.CompoundIndex;
++import org.springframework.data.mongodb.core.index.CompoundIndexes;
+ import org.springframework.data.mongodb.core.mapping.Document;
+
+ @EqualsAndHashCode(callSuper = true)
+ @Data
+ @FieldNameConstants
+ @Document(collection = "case_tag")
++@CompoundIndexes({
++    @CompoundIndex(name = "appId_operationName", def = "{'appId': 1, 'operationName': 1}")
++})
+ public class CaseTagCollection extends ModelBase {
+```
+
+**2. `arex-web-core/.../repository/CaseTagRepository.java`** — add the count method to the interface:
+```diff
+   int batchAdd(List<CaseTagDto> dtos);
++
++  /**
++   * Count how many records are already tagged for this appId + operationName, combined across
++   * tag types. Used to enforce the per-operation count limit.
++   */
++  long countByAppIdAndOperationName(String appId, String operationName);
+ }
+```
+
+**3. `arex-web-core/.../repository/mongo/CaseTagRepositoryImpl.java`** — implement it:
+```diff
+   private static final String RECORD_ID = "recordId";
++  private static final String OPERATION_NAME = "operationName";
+```
+```diff
+     Collection<CaseTagCollection> inserted = mongoTemplate.insert(daos, CaseTagCollection.class);
+     return inserted.size();
+   }
++
++  @Override
++  public long countByAppIdAndOperationName(String appId, String operationName) {
++    Query query = Query.query(
++        Criteria.where(APP_ID).is(appId).and(OPERATION_NAME).is(operationName));
++    return mongoTemplate.count(query, CaseTagCollection.class);
++  }
+ }
+```
+
+**4. `arex-web-model-contract/.../tag/BatchAddCaseTagsByOperationResponseType.java`** — report what got skipped:
+```diff
+   private int tagged;
++
++  /**
++   * How many otherwise-eligible candidates were left untagged because the per-operation count
++   * limit was already reached or would have been exceeded.
++   */
++  private int skippedForLimit;
+ }
+```
+
+**5. `arex-web-core/.../business/CaseTagService.java`** — the actual enforcement. Three separate edits to the existing file:
+
+Add the import and the configurable field, alongside the existing repository fields:
+```diff
+ import org.apache.commons.lang3.StringUtils;
++import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.stereotype.Component;
+```
+```diff
+   private static final List<String> CASE_SHOW_FIELDS = List.of(
+       "planId", "planItemId", "recordId", "replayId", "operationName", "diffResultCode");
+
++  /**
++   * Upper bound on tagged records per (appId, operationName), combined across tag types. This is
++   * a hard, zero-overshoot cap: the candidate list is trimmed to the remaining budget before
++   * Storage is ever called, so a batch can never push the count past this value.
++   */
++  @Value("${arex.tag.limit.count.maxPerOperation:5000}")
++  private long maxTaggedPerOperation;
++
+   @Resource
+   private ReplayCompareResultRepository replayCompareResultRepository;
+```
+
+Insert the enforcement between the existing candidate-filtering loop (step 3) and the Storage call (step 4):
+```diff
+       candidates.add(c);
+       recordIds.add(recordId);
+     }
+
++    // 3.5. Enforce the per-operation count limit as a hard, pre-flight cap: trim the candidate
++    // list to whatever's left of the budget before Storage is ever called, so a batch can never
++    // push (appId, operationName) past maxTaggedPerOperation.
++    long alreadyTagged = caseTagRepository.countByAppIdAndOperationName(appId,
++        request.getOperationName());
++    long remaining = Math.max(0, maxTaggedPerOperation - alreadyTagged);
++    int skippedForLimit = 0;
++    if (candidates.size() > remaining) {
++      skippedForLimit = (int) (candidates.size() - remaining);
++      candidates = candidates.subList(0, (int) remaining);
++      recordIds = recordIds.subList(0, (int) remaining);
++    }
++
+     // 4. Tag mock records in Storage (source of truth) - chunked internally
+     TagBatchResult tagResult = mockTagSyncService.addTagsBatch(recordIds, tagType);
+```
+
+Report the count in the response:
+```diff
+     int tagged = caseTagRepository.batchAdd(toInsert);
+     BatchAddCaseTagsByOperationResponseType res = new BatchAddCaseTagsByOperationResponseType();
+     res.setTagged(tagged);
++    res.setSkippedForLimit(skippedForLimit);
+     return res;
+   }
+```
+
+**6. `arex-web-api/src/main/resources/application.yaml`** — the config default, next to the existing `arex.storage.*` block:
+```diff
+             url: ${arex.storage.service.url}/api/storage/edit/addTagsBatch/
++  # case tag limits (feature/case-tag-limit-count branch)
++  tag:
++    limit:
++      count:
++        maxPerOperation: 5000
+   # call schedule
+```
+
+**Live-tested result** (real data, `maxPerOperation=5` for the test, 20 real eligible candidates for one operation): first call → `{"tagged": 5, "skippedForLimit": 15}`, confirmed exactly 5 docs in Mongo; re-running the same call → `{"tagged": 0, "skippedForLimit": 15}`, stays capped; a *different* operation on the same app got its own independent 5-record budget, unaffected by the first.
+
+### 7.2 Option: byte budget + count backstop (`feature/case-tag-limit-byte-and-count`)
+
+**6 files touched: 3 brand-new files (a collection + a repository interface/impl), 1 modified response type, 1 modified service, 1 config block.**
+
+**1. New file — `arex-web-model/src/main/java/com/arextest/web/model/dao/mongodb/CaseTagUsageCollection.java`:**
+```java
+package com.arextest.web.model.dao.mongodb;
+
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.experimental.FieldNameConstants;
+import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.mapping.Document;
+
+/**
+ * Running totals of tagged-record storage usage per appId, combined across tag types. Maintained
+ * via atomic $inc so reading/updating it stays O(1) regardless of how large case_tag grows - see
+ * documents/proposals/case-tag-storage-limit-proposal.md §6.3/§6.3.3.
+ */
+@EqualsAndHashCode(callSuper = true)
+@Data
+@FieldNameConstants
+@Document(collection = "case_tag_usage")
+public class CaseTagUsageCollection extends ModelBase {
+
+  @Indexed(unique = true)
+  private String appId;
+
+  private long usedBytes;
+
+  private long usedCount;
+
+  /**
+   * The effective limit as of the last update (global default at time of writing - see
+   * CaseTagService). Snapshotted here so a Grafana panel can read "used vs. limit" from this one
+   * document without a join.
+   */
+  private long limitBytes;
+
+  /**
+   * usedBytes / limitBytes * 100, recomputed on every update.
+   */
+  private double usagePercent;
+}
+```
+
+**2. New file — `arex-web-core/src/main/java/com/arextest/web/core/repository/CaseTagUsageRepository.java`:**
+```java
+package com.arextest.web.core.repository;
+
+import com.arextest.web.model.dao.mongodb.CaseTagUsageCollection;
+
+public interface CaseTagUsageRepository extends RepositoryProvider {
+
+  /**
+   * Current usage for appId, or null if this app has never tagged anything yet.
+   */
+  CaseTagUsageCollection findByAppId(String appId);
+
+  /**
+   * Atomically add deltaBytes/deltaCount to the app's running totals (upserting on the app's
+   * first tag), then refresh limitBytes/usagePercent against the currently-effective limit.
+   */
+  void incrementUsage(String appId, long deltaBytes, long deltaCount, long effectiveLimitBytes);
+}
+```
+
+**3. New file — `arex-web-core/src/main/java/com/arextest/web/core/repository/mongo/CaseTagUsageRepositoryImpl.java`:**
+```java
+package com.arextest.web.core.repository.mongo;
+
+import com.arextest.web.core.repository.CaseTagUsageRepository;
+import com.arextest.web.model.dao.mongodb.CaseTagUsageCollection;
+import jakarta.annotation.Resource;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.mongodb.core.FindAndModifyOptions;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+public class CaseTagUsageRepositoryImpl implements CaseTagUsageRepository {
+
+  private static final String APP_ID = "appId";
+  private static final String USED_BYTES = "usedBytes";
+  private static final String USED_COUNT = "usedCount";
+  private static final String LIMIT_BYTES = "limitBytes";
+  private static final String USAGE_PERCENT = "usagePercent";
+
+  @Resource
+  private MongoTemplate mongoTemplate;
+
+  @Override
+  public CaseTagUsageCollection findByAppId(String appId) {
+    return mongoTemplate.findOne(Query.query(Criteria.where(APP_ID).is(appId)),
+        CaseTagUsageCollection.class);
+  }
+
+  @Override
+  public void incrementUsage(String appId, long deltaBytes, long deltaCount,
+      long effectiveLimitBytes) {
+    long now = System.currentTimeMillis();
+    Query query = Query.query(Criteria.where(APP_ID).is(appId));
+
+    // Step 1: atomic increment (and upsert on this app's first tag ever). $inc on a fixed-size
+    // scalar field never changes the document's BSON size, so this stays O(1) regardless of how
+    // much usage has already accumulated - see the proposal doc §6.3.3.
+    Update inc = new Update()
+        .inc(USED_BYTES, deltaBytes)
+        .inc(USED_COUNT, deltaCount)
+        .set(DATA_CHANGE_UPDATE_TIME, now)
+        .setOnInsert(APP_ID, appId)
+        .setOnInsert(DATA_CHANGE_CREATE_TIME, now);
+
+    CaseTagUsageCollection updated = mongoTemplate.findAndModify(query, inc,
+        FindAndModifyOptions.options().upsert(true).returnNew(true),
+        CaseTagUsageCollection.class);
+    if (updated == null) {
+      return;
+    }
+
+    // Step 2: refresh the limit snapshot + recompute the persisted percentage. A second small
+    // write, still one document, still O(1) - not proportional to batch size or historical usage.
+    double usagePercent =
+        effectiveLimitBytes <= 0 ? 0 : (updated.getUsedBytes() * 100.0) / effectiveLimitBytes;
+    mongoTemplate.updateFirst(query,
+        new Update().set(LIMIT_BYTES, effectiveLimitBytes).set(USAGE_PERCENT, usagePercent),
+        CaseTagUsageCollection.class);
+  }
+}
+```
+
+**4. `arex-web-model-contract/.../tag/BatchAddCaseTagsByOperationResponseType.java`** — report a hard rejection:
+```diff
+   private int tagged;
++
++  /**
++   * True when the whole request was rejected because the app was already at/over its combined
++   * byte budget or record-count backstop before this batch started.
++   */
++  private boolean rejectedForQuota;
+ }
+```
+
+**5. `arex-web-core/.../business/CaseTagService.java`** — the enforcement. Four separate edits to the existing file:
+
+Imports and configurable fields, alongside the existing repository fields:
+```diff
+ import com.arextest.web.core.repository.CaseTagRepository;
++import com.arextest.web.core.repository.CaseTagUsageRepository;
+ import com.arextest.web.core.repository.ReplayCompareResultRepository;
+ import com.arextest.web.model.contract.contracts.tag.BatchAddCaseTagsByOperationRequestType;
+ import com.arextest.web.model.contract.contracts.tag.BatchAddCaseTagsByOperationResponseType;
++import com.arextest.web.model.dao.mongodb.CaseTagUsageCollection;
+ import com.arextest.web.model.dto.CaseTagDto;
+```
+```diff
+ import org.apache.commons.lang3.StringUtils;
++import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.stereotype.Component;
+```
+```diff
+   private static final List<String> CASE_SHOW_FIELDS = List.of(
+       "planId", "planItemId", "recordId", "replayId", "operationName", "diffResultCode");
+
++  /**
++   * Global default byte budget per appId, combined across tag types. This branch implements the
++   * soft-cap design (proposal doc §4 design A / §6.3 fallback): checked once before the batch
++   * starts, accepting bounded overshoot of at most one chunk, since there's no Storage-side
++   * read-only sizing endpoint to pre-check individual candidate sizes against yet (§6.3.2). No
++   * per-app override in this branch - see the proposal doc §6.3.1 for that extension.
++   */
++  @Value("${arex.tag.storage.defaultMaxBytes:1073741824}")
++  private long defaultMaxBytes;
++
++  /**
++   * Generous, global, non-overridable backstop against a pathological tiny-record scenario -
++   * bytes should trip first for any realistic payload size. See proposal doc §6.2.
++   */
++  @Value("${arex.tag.storage.maxTaggedRecordsBackstop:1000000}")
++  private long maxTaggedRecordsBackstop;
++
+   @Resource
+   private ReplayCompareResultRepository replayCompareResultRepository;
+
+   @Resource
+   private CaseTagRepository caseTagRepository;
+
++  @Resource
++  private CaseTagUsageRepository caseTagUsageRepository;
++
+   @Resource
+   private MockTagSyncService mockTagSyncService;
+```
+
+Insert the pre-flight check as the very first thing in `batchAddByOperation`, before today's step 1:
+```diff
+     String appId = request.getAppId();
+     String tagType = request.getTagType();
+
++    // 0. Pre-flight quota check: reject the whole request if this app is already at/over its
++    // combined byte budget or record-count backstop. No Mongo scan, no Storage calls beyond
++    // this one indexed usage lookup - cheapest possible rejection (proposal doc §6.3 step 2).
++    CaseTagUsageCollection usage = caseTagUsageRepository.findByAppId(appId);
++    long usedBytesBefore = usage == null ? 0 : usage.getUsedBytes();
++    long usedCountBefore = usage == null ? 0 : usage.getUsedCount();
++    if (usedBytesBefore >= defaultMaxBytes || usedCountBefore >= maxTaggedRecordsBackstop) {
++      BatchAddCaseTagsByOperationResponseType rejected =
++          new BatchAddCaseTagsByOperationResponseType();
++      rejected.setTagged(0);
++      rejected.setRejectedForQuota(true);
++      return rejected;
++    }
++
+     // 1. Query all compare results for this plan (select only 6 fields)
+```
+
+Record the batch's contribution after the existing insert call:
+```diff
+     int tagged = caseTagRepository.batchAdd(toInsert);
++
++    // 6. Record this batch's contribution against the app's running usage totals in one atomic
++    // increment - O(1) regardless of batch size, see proposal doc §6.3.3.
++    if (tagged > 0) {
++      long batchBytes = toInsert.stream()
++          .mapToLong(dto -> dto.getRecordSizeBytes() == null ? 0L : dto.getRecordSizeBytes())
++          .sum();
++      caseTagUsageRepository.incrementUsage(appId, batchBytes, tagged, defaultMaxBytes);
++    }
++
+     BatchAddCaseTagsByOperationResponseType res = new BatchAddCaseTagsByOperationResponseType();
+     res.setTagged(tagged);
+     return res;
+   }
+```
+
+**6. `arex-web-api/src/main/resources/application.yaml`** — the config defaults:
+```diff
+             url: ${arex.storage.service.url}/api/storage/edit/addTagsBatch/
++  # case tag limits (feature/case-tag-limit-byte-and-count branch)
++  tag:
++    storage:
++      defaultMaxBytes: 1073741824
++      maxTaggedRecordsBackstop: 1000000
+   # call schedule
+```
+
+**Live-tested results** (real data, 20 real eligible candidates, ~2-4KB each):
+- Byte budget path (`defaultMaxBytes=20000`): first call proceeded (app started at 0 usage, under budget) and tagged all 20 → `usedBytes` landed at **43,763** — over the cap, in one batch, the soft-cap's accepted "bounded overshoot" trade-off, visible directly. `usagePercent` persisted at **218.8%**. A follow-up call (different operation, same app) → `{"tagged": 0, "rejectedForQuota": true}` immediately, no Storage call made.
+- Count backstop path (isolated with a huge byte budget, `maxTaggedRecordsBackstop=3`): first call proceeded (0 < 3) and tagged all 20; a follow-up call → `{"tagged": 0, "rejectedForQuota": true}` once `usedCount(20) >= 3`.
+
+### 7.3 Config key summary
+
+| Key | Branch | Default | Meaning |
+|---|---|---|---|
+| `arex.tag.limit.count.maxPerOperation` | count-limit | `5000` | Max tagged records per `(appId, operationName)`, combined across tag types |
+| `arex.tag.storage.defaultMaxBytes` | byte+count | `1073741824` (1GB) | Max combined tagged bytes per `appId` — **placeholder default, see §6.5 for how to set it from real data**, not yet measured against your production record sizes |
+| `arex.tag.storage.maxTaggedRecordsBackstop` | byte+count | `1000000` | Generous, non-overridable count backstop per `appId` |
