@@ -75,6 +75,11 @@ arex:
         add:
           batch:
             url: ${arex.storage.service.url}/api/storage/edit/addTagsBatch/
+  # case tag limits (feature/case-tag-limit-count branch)
+  tag:
+    limit:
+      count:
+        maxPerOperation: 5000
   # call schedule
   schedule:
     stop:

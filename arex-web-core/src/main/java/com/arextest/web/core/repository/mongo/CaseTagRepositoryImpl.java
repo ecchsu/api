@@ -27,6 +27,7 @@ public class CaseTagRepositoryImpl implements CaseTagRepository {
   private static final String PLAN_ID = "planId";
   private static final String TAG_TYPE = "tagType";
   private static final String RECORD_ID = "recordId";
+  private static final String OPERATION_NAME = "operationName";
 
   @Resource
   private MongoTemplate mongoTemplate;
@@ -65,5 +66,12 @@ public class CaseTagRepositoryImpl implements CaseTagRepository {
 
     Collection<CaseTagCollection> inserted = mongoTemplate.insert(daos, CaseTagCollection.class);
     return inserted.size();
+  }
+
+  @Override
+  public long countByAppIdAndOperationName(String appId, String operationName) {
+    Query query = Query.query(
+        Criteria.where(APP_ID).is(appId).and(OPERATION_NAME).is(operationName));
+    return mongoTemplate.count(query, CaseTagCollection.class);
   }
 }

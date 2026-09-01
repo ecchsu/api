@@ -16,6 +16,7 @@ import java.util.Set;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Slf4j
@@ -26,6 +27,14 @@ public class CaseTagService {
 
   private static final List<String> CASE_SHOW_FIELDS = List.of(
       "planId", "planItemId", "recordId", "replayId", "operationName", "diffResultCode");
+
+  /**
+   * Upper bound on tagged records per (appId, operationName), combined across tag types. This is
+   * a hard, zero-overshoot cap: the candidate list is trimmed to the remaining budget before
+   * Storage is ever called, so a batch can never push the count past this value.
+   */
+  @Value("${arex.tag.limit.count.maxPerOperation:5000}")
+  private long maxTaggedPerOperation;
 
   @Resource
   private ReplayCompareResultRepository replayCompareResultRepository;
@@ -67,6 +76,19 @@ public class CaseTagService {
       recordIds.add(recordId);
     }
 
+    // 3.5. Enforce the per-operation count limit as a hard, pre-flight cap: trim the candidate
+    // list to whatever's left of the budget before Storage is ever called, so a batch can never
+    // push (appId, operationName) past maxTaggedPerOperation.
+    long alreadyTagged = caseTagRepository.countByAppIdAndOperationName(appId,
+        request.getOperationName());
+    long remaining = Math.max(0, maxTaggedPerOperation - alreadyTagged);
+    int skippedForLimit = 0;
+    if (candidates.size() > remaining) {
+      skippedForLimit = (int) (candidates.size() - remaining);
+      candidates = candidates.subList(0, (int) remaining);
+      recordIds = recordIds.subList(0, (int) remaining);
+    }
+
     // 4. Tag mock records in Storage (source of truth) - chunked internally
     TagBatchResult tagResult = mockTagSyncService.addTagsBatch(recordIds, tagType);
     Set<String> matched = tagResult.getMatchedRecordIds();
@@ -83,6 +105,7 @@ public class CaseTagService {
     int tagged = caseTagRepository.batchAdd(toInsert);
     BatchAddCaseTagsByOperationResponseType res = new BatchAddCaseTagsByOperationResponseType();
     res.setTagged(tagged);
+    res.setSkippedForLimit(skippedForLimit);
     return res;
   }
 

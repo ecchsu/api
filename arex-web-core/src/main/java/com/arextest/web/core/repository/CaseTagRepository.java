@@ -16,4 +16,10 @@ public interface CaseTagRepository extends RepositoryProvider {
    * Bulk insert tag entries. Returns the number of documents actually inserted.
    */
   int batchAdd(List<CaseTagDto> dtos);
+
+  /**
+   * Count how many records are already tagged for this appId + operationName, combined across
+   * tag types. Used to enforce the per-operation count limit.
+   */
+  long countByAppIdAndOperationName(String appId, String operationName);
 }
