@@ -70,6 +70,11 @@ arex:
     view:
       record:
         url: ${arex.storage.service.url}/api/storage/replay/query/viewRecord
+    update:
+      tags:
+        add:
+          batch:
+            url: ${arex.storage.service.url}/api/storage/edit/addTagsBatch/
   # call schedule
   schedule:
     stop:
