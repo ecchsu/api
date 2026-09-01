@@ -75,6 +75,11 @@ arex:
         add:
           batch:
             url: ${arex.storage.service.url}/api/storage/edit/addTagsBatch/
+  # case tag limits (feature/case-tag-limit-byte-and-count branch)
+  tag:
+    storage:
+      defaultMaxBytes: 1073741824
+      maxTaggedRecordsBackstop: 1000000
   # call schedule
   schedule:
     stop:

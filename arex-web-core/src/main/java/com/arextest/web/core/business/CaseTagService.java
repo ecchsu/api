@@ -2,9 +2,11 @@ package com.arextest.web.core.business;
 
 import com.arextest.web.core.business.MockTagSyncService.TagBatchResult;
 import com.arextest.web.core.repository.CaseTagRepository;
+import com.arextest.web.core.repository.CaseTagUsageRepository;
 import com.arextest.web.core.repository.ReplayCompareResultRepository;
 import com.arextest.web.model.contract.contracts.tag.BatchAddCaseTagsByOperationRequestType;
 import com.arextest.web.model.contract.contracts.tag.BatchAddCaseTagsByOperationResponseType;
+import com.arextest.web.model.dao.mongodb.CaseTagUsageCollection;
 import com.arextest.web.model.dto.CaseTagDto;
 import com.arextest.web.model.dto.CompareResultDto;
 import com.arextest.web.model.enums.DiffResultCode;
@@ -16,6 +18,7 @@ import java.util.Set;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Slf4j
@@ -27,11 +30,31 @@ public class CaseTagService {
   private static final List<String> CASE_SHOW_FIELDS = List.of(
       "planId", "planItemId", "recordId", "replayId", "operationName", "diffResultCode");
 
+  /**
+   * Global default byte budget per appId, combined across tag types. This branch implements the
+   * soft-cap design (proposal doc §4 design A / §6.3 fallback): checked once before the batch
+   * starts, accepting bounded overshoot of at most one chunk, since there's no Storage-side
+   * read-only sizing endpoint to pre-check individual candidate sizes against yet (§6.3.2). No
+   * per-app override in this branch - see the proposal doc §6.3.1 for that extension.
+   */
+  @Value("${arex.tag.storage.defaultMaxBytes:1073741824}")
+  private long defaultMaxBytes;
+
+  /**
+   * Generous, global, non-overridable backstop against a pathological tiny-record scenario -
+   * bytes should trip first for any realistic payload size. See proposal doc §6.2.
+   */
+  @Value("${arex.tag.storage.maxTaggedRecordsBackstop:1000000}")
+  private long maxTaggedRecordsBackstop;
+
   @Resource
   private ReplayCompareResultRepository replayCompareResultRepository;
 
   @Resource
   private CaseTagRepository caseTagRepository;
+
+  @Resource
+  private CaseTagUsageRepository caseTagUsageRepository;
 
   @Resource
   private MockTagSyncService mockTagSyncService;
@@ -40,6 +63,20 @@ public class CaseTagService {
       BatchAddCaseTagsByOperationRequestType request) {
     String appId = request.getAppId();
     String tagType = request.getTagType();
+
+    // 0. Pre-flight quota check: reject the whole request if this app is already at/over its
+    // combined byte budget or record-count backstop. No Mongo scan, no Storage calls beyond
+    // this one indexed usage lookup - cheapest possible rejection (proposal doc §6.3 step 2).
+    CaseTagUsageCollection usage = caseTagUsageRepository.findByAppId(appId);
+    long usedBytesBefore = usage == null ? 0 : usage.getUsedBytes();
+    long usedCountBefore = usage == null ? 0 : usage.getUsedCount();
+    if (usedBytesBefore >= defaultMaxBytes || usedCountBefore >= maxTaggedRecordsBackstop) {
+      BatchAddCaseTagsByOperationResponseType rejected =
+          new BatchAddCaseTagsByOperationResponseType();
+      rejected.setTagged(0);
+      rejected.setRejectedForQuota(true);
+      return rejected;
+    }
 
     // 1. Query all compare results for this plan (select only 6 fields)
     List<CompareResultDto> cases = replayCompareResultRepository.queryCompareResults(
@@ -81,6 +118,16 @@ public class CaseTagService {
     }
 
     int tagged = caseTagRepository.batchAdd(toInsert);
+
+    // 6. Record this batch's contribution against the app's running usage totals in one atomic
+    // increment - O(1) regardless of batch size, see proposal doc §6.3.3.
+    if (tagged > 0) {
+      long batchBytes = toInsert.stream()
+          .mapToLong(dto -> dto.getRecordSizeBytes() == null ? 0L : dto.getRecordSizeBytes())
+          .sum();
+      caseTagUsageRepository.incrementUsage(appId, batchBytes, tagged, defaultMaxBytes);
+    }
+
     BatchAddCaseTagsByOperationResponseType res = new BatchAddCaseTagsByOperationResponseType();
     res.setTagged(tagged);
     return res;
